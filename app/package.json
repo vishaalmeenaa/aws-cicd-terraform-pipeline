@@ -1,0 +1,11 @@
+{
+  "name": "cicd-demo-app",
+  "version": "1.0.0",
+  "description": "Small Node.js app used to demo a CI/CD pipeline on AWS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

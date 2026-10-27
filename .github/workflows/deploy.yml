@@ -1,0 +1,122 @@
+name: CI/CD - Build, Push and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  PROJECT_NAME: cicd-demo
+  CONTAINER_PORT: "3000"
+  TF_VAR_aws_region: ap-south-1
+
+# Only one run at a time so two pipelines never touch the Terraform state together
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run unit tests
+        working-directory: app
+        run: npm test
+
+  validate-terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Init (no backend) and validate
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  deploy:
+    name: Build, push and deploy
+    needs: [test, validate-terraform]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Terraform init (S3 remote state)
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+
+      # The ECR repository must exist before we can push an image to it
+      - name: Create ECR repository first
+        run: terraform apply -auto-approve -input=false -target=aws_ecr_repository.app
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        working-directory: app
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/${{ env.PROJECT_NAME }}-app"
+          docker build -t "$IMAGE:$IMAGE_TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest"
+
+      - name: Terraform apply (infrastructure + deploy new image)
+        run: terraform apply -auto-approve -input=false -var="image_tag=${{ github.sha }}"
+
+      - name: Smoke test the deployed app
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          SERVICE=$(terraform output -raw ecs_service_name)
+
+          TASK_ARN=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+            --query 'taskArns[0]' --output text)
+          ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+            --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
+            --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+
+          echo "App URL: http://$IP:${{ env.CONTAINER_PORT }}/"
+          curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-connrefused \
+            "http://$IP:${{ env.CONTAINER_PORT }}/health"
+          echo
+          curl --fail --silent "http://$IP:${{ env.CONTAINER_PORT }}/"
+          echo

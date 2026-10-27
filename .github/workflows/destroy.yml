@@ -1,0 +1,46 @@
+name: Destroy infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to delete all AWS resources created by this project'
+        required: true
+
+env:
+  AWS_REGION: ap-south-1
+  PROJECT_NAME: cicd-demo
+  TF_VAR_aws_region: ap-south-1
+
+jobs:
+  destroy:
+    if: ${{ github.event.inputs.confirm == 'destroy' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform destroy
+        run: terraform destroy -auto-approve -input=false
